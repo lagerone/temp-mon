@@ -20,6 +20,84 @@ async function getCpuTemperature(): Promise<number | null> {
     );
   }
 
+  // Windows AMD fallback strategies:
+  // 1. Try LibreHardwareMonitor or OpenHardwareMonitor via PowerShell if present.
+  // 2. Try wmic / WMI classes (often not accurate for AMD, but attempt).
+  if (process.platform === 'win32') {
+    // Attempt LibreHardwareMonitor CLI (user must have it). We'll look for a process that can output JSON.
+    // If user runs LibreHardwareMonitor with remote web server or logging, they can point to a file path via ENV.
+    const lhmPath = process.env.LHM_JSON_PATH; // user-provided exported JSON from LibreHardwareMonitor
+    if (lhmPath && fs.existsSync(lhmPath)) {
+      try {
+        const json = JSON.parse(fs.readFileSync(lhmPath, 'utf8')) as any;
+        // Traverse sensors for CPU Package or CCD temps
+        // LibreHardwareMonitor JSON structure often: {"Children":[{"Text":"CPU","Children":[{"Text":"Core (Tctl/Tdie)","Value":55.3}, ...]}]}
+        let best: number | null = null;
+        const walk = (node: any) => {
+          if (!node || typeof node !== 'object') return;
+          const text: string | undefined = node.Text;
+          const value: number | undefined = node.Value;
+          if (
+            text &&
+            /tctl|tdie|package|cpu temp|ccd|core \(tctl\/tdie\)/i.test(text) &&
+            typeof value === 'number'
+          ) {
+            if (best === null || value > best) best = value;
+          }
+          const children: any[] | undefined = node.Children;
+          if (Array.isArray(children)) {
+            for (const child of children) walk(child);
+          }
+        };
+        walk(json);
+        if (best !== null) return best;
+      } catch (err) {
+        logger.debug('Failed parsing LibreHardwareMonitor JSON', { err });
+      }
+    }
+
+    // Try OpenHardwareMonitor WMI (OHM must be running). Namespace: root\OpenHardwareMonitor
+    try {
+      // Use PowerShell to query WMI sensor temperatures related to CPU
+      const psScript = `Get-CimInstance -Namespace root\\OpenHardwareMonitor -ClassName Sensor | Where-Object { $_.SensorType -eq 'Temperature' -and $_.Identifier -match 'cpu' } | Sort-Object Value -Descending | Select-Object -First 1 -ExpandProperty Value`;
+      const out = execSync(`powershell -NoProfile -Command "${psScript}"`, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      })
+        .toString()
+        .trim();
+      if (out) {
+        const parsed = parseFloat(out);
+        if (!Number.isNaN(parsed)) return parsed;
+      }
+    } catch (err) {
+      logger.debug('OpenHardwareMonitor WMI query failed (likely not running)', { err });
+    }
+
+    // Fallback WMI using MSAcpi_ThermalZoneTemperature (often unreliable on AMD)
+    try {
+      const wmiScript = `Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root\\wmi | Select-Object -First 1 -ExpandProperty CurrentTemperature`;
+      const raw = execSync(`powershell -NoProfile -Command "${wmiScript}"`, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      })
+        .toString()
+        .trim();
+      if (raw) {
+        // Value is in tenths of Kelvin
+        const val = parseInt(raw, 10);
+        if (!Number.isNaN(val) && val > 0) {
+          const c = val / 10 - 273.15;
+          if (c > -50 && c < 150) {
+            return parseFloat(c.toFixed(1));
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('MSAcpi_ThermalZoneTemperature WMI fallback failed', { err });
+    }
+  }
+
   // Fallback: iterate thermal zones
   try {
     const basePath = '/sys/class/thermal';
